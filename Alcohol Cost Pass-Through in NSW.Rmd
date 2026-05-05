@@ -1,0 +1,551 @@
+---
+title: "Alcohol Cost Pass-Through in New South Wales"
+author: "Nini Dai"
+date: "30 April 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE
+  )
+
+# Load packages
+library(tidyverse)
+library(janitor)
+library(zoo)
+library(rqpd)
+library(knitr)
+library(kableExtra)
+library(scales)
+```
+
+
+```{r load_data}
+rds_path <- "data/long_stk202507M_NSW.rds"
+cpi_path <- "data/CPI_ALL.csv"
+
+stk_df <- readRDS(rds_path)
+```
+
+```{r data_cleaning}
+# Data Cleaning and Variable Construction
+stk_df <- stk_df %>%
+  mutate(
+    # Turn TimeM to time-orderd factor
+    TimeM = factor(TimeM, levels = sort(unique(TimeM))),
+    RetProdID = paste(Retailer, ProductID, Location, Units_, sep = "_"),
+    Qtr = substr(as.character(TimeM),6,7),
+    Yr = case_when(
+      TimeM %in% c("2024-04","2024-01","2023-10","2023-07") ~ 0,
+      TimeM %in% c("2025-04","2025-01","2024-10","2024-07") ~ 1,
+      TimeM %in% c("2026-04","2026-01","2025-10","2025-07") ~ 2,
+      TRUE ~ NA_real_
+    ),
+    Year = case_when(
+      TimeM %in% c("2024-04","2024-01","2023-10","2023-07") ~ "2023/24",
+      TimeM %in% c("2025-04","2025-01","2024-10","2024-07") ~ "2024/25",
+      TRUE ~ NA_character_
+    ),
+    # Second mutate to set TPoint (set the earliest TimeM as 0)
+    TPoint = as.numeric(TimeM) - min(as.numeric(TimeM), na.rm = TRUE)
+    )
+``` 
+
+```{r deep_cleaning}
+stk_analysis_df <- stk_df %>%
+  filter(
+    is.finite(Price_std_drk_),
+    Price_std_drk_ > 0,
+    ZEROALC != "0Alc",
+    !(TimeM %in% c("2023-08", "2023-09")),
+    Location != "Newcastle",
+    PUVar != "O"
+  )
+```
+
+``` {r cpi}
+# Create CPI tibble with TimeDate (Date) and CPI (numeric index level)
+cpi <- read_csv(cpi_path, show_col_types = FALSE) %>%
+  clean_names() %>%
+  select(time_period, obs_value) %>%
+  transmute(
+    TimeM_ym = as.yearmon(time_period, "%Y-%m"),
+    CPI = suppressWarnings(as.numeric(obs_value))
+  ) %>%
+  arrange(TimeM_ym) %>%
+  filter(!is.na(TimeM_ym), !is.na(CPI)) %>%
+  distinct(TimeM_ym, .keep_all = TRUE) %>%
+  mutate(TimeM = format(TimeM_ym, "%Y-%m"))
+
+# Merge CPI into stk dataset
+stk_analysis_df <- stk_analysis_df %>%
+  left_join(cpi %>% select(TimeM, CPI), by = "TimeM")
+```
+
+``` {r fully_cleaned_data}
+stk_clean <- stk_analysis_df %>%
+  mutate(
+    RetPID = paste(Retailer, ProductID, Location, Units_, sep = "_"),
+    senseLong = case_when(
+      !is.finite(Price_unit_) ~ "No unit price",
+      Price_unit_ < .25 ~ "Price_unit<.25",
+      Price_100mL_ < .2 ~ "Price_100mL<.2",
+      Price_100mL_ > 4 & CATEGORY == "Beer" ~ "Price_100mL>4 beer",
+      Price_100mL_ > 4 & CATEGORY == "Cider" ~ "Price_100mL>4 cider",
+      Price_100mL_ > 10 & CATEGORY == "Premix" ~ "Price_100mL>10 premix",
+      Price_100mL_ > 100 & CATEGORY == "Wine" ~ "Price_100mL>100 wine",
+      Price_100mL_ > 300 & CATEGORY == "Spirits" ~ "Price_100mL>300 spirits",
+      CATEGORY == "Cider" & Price_std_drk_ < .2 ~ "Price_std_drk<.2 cider",
+      CATEGORY == "Wine" & Price_std_drk_ < .2 ~ "Price_std_drk<.2 wine",
+      CATEGORY == "Beer" & Price_std_drk_ < .6 ~ "Price_std_drk<.6 beer",
+      CATEGORY %in% c("Spirits", "Premix") & Price_std_drk_ < .6 ~ "Price_std_drk<.6 spirits",
+      CATEGORY == "Premix" & Price_std_drk_ > 10 & ZEROALC == "1Alc" ~ "Price_std_drk>10 premix alc.",
+      ZEROALC == "0Alc" & Size_R > 0 & is.finite(Size_R) ~ "0",
+      TRUE ~ as.character(Std_drk_exclude)
+    )
+  ) %>%
+  filter(LongExc == 0) %>%
+  # Tax related variables
+  mutate(
+    Tax_std_drk = case_when(
+      # very low Alc
+      Alc_pct_W <= 1.15 ~ 0, # CATEGORY %in% c("Beer","Wine") 
+      
+      # Brandy
+      Brandy == "Brandy" & as.character(TimeM) == "2023-07" ~ 91.43 / 78.9,
+      Brandy == "Brandy" & as.character(TimeM) %in% c("2023-10", "2024-01") ~ 93.44 / 78.9,
+      Brandy == "Brandy" & as.character(TimeM) %in% c("2024-04", "2024-07") ~ 95.12 / 78.9,
+      Brandy == "Brandy" & as.character(TimeM) > "2024-07" & as.character(TimeM) <= "2025-01" ~ 97.02 / 78.9,
+      Brandy == "Brandy" & as.character(TimeM) > "2025-01" & as.character(TimeM) <= "2025-07" ~ 97.41 / 78.9,
+      
+      # Spirits/ Premix
+      CATEGORY %in% c("Spirits", "Premix") & as.character(TimeM) == "2023-07" ~ 97.9 / 78.9,
+      CATEGORY %in% c("Spirits", "Premix") & as.character(TimeM) %in% c("2023-10", "2024-01") ~ 100.05 / 78.9,
+      CATEGORY %in% c("Spirits", "Premix") & as.character(TimeM) %in% c("2024-04", "2024-07") ~ 101.85 / 78.9,
+      CATEGORY %in% c("Spirits", "Premix") & as.character(TimeM) > "2024-07" & as.character(TimeM) <= "2025-01" ~ 103.89 / 78.9,
+      CATEGORY %in% c("Spirits", "Premix") & as.character(TimeM) > "2025-01" & as.character(TimeM) <= "2025-07" ~ 104.31 / 78.9,
+      
+      # Beer alc <= 3
+      CATEGORY == "Beer" & !is.na(Alc_pct_W) & Alc_pct_W <= 3 & as.character(TimeM) == "2023-07" ~
+        49.63 * (Alc_pct_W - 1.15) / (78.9 * Alc_pct_W),
+      CATEGORY == "Beer" & !is.na(Alc_pct_W) & Alc_pct_W <= 3 & as.character(TimeM) %in% c("2023-10", "2024-01") ~
+        50.72 * (Alc_pct_W - 1.15) / (78.9 * Alc_pct_W),
+      CATEGORY == "Beer" & !is.na(Alc_pct_W) & Alc_pct_W <= 3 & as.character(TimeM) %in% c("2024-04", "2024-07") ~
+        51.63 * (Alc_pct_W - 1.15) / (78.9 * Alc_pct_W),
+      CATEGORY == "Beer" & !is.na(Alc_pct_W) & Alc_pct_W <= 3 & as.character(TimeM) > "2024-07" & as.character(TimeM) <= "2025-01" ~
+        52.66 * (Alc_pct_W - 1.15) / (78.9 * Alc_pct_W),
+      CATEGORY == "Beer" & !is.na(Alc_pct_W) & Alc_pct_W <= 3 & as.character(TimeM) > "2025-01" & as.character(TimeM) <= "2025-07" ~
+        52.87 * (Alc_pct_W - 1.15) / (78.9 * Alc_pct_W),
+      
+      # Beer alc > 3
+      CATEGORY == "Beer" & !is.na(Alc_pct_W) & as.character(TimeM) == "2023-07" ~
+        57.79 * (Alc_pct_W - 1.15) / (78.9 * Alc_pct_W),
+      CATEGORY == "Beer" & !is.na(Alc_pct_W) & as.character(TimeM) %in% c("2023-10", "2024-01") ~
+        59.06 * (Alc_pct_W - 1.15) / (78.9 * Alc_pct_W),
+      CATEGORY == "Beer" & !is.na(Alc_pct_W) & as.character(TimeM) %in% c("2024-04", "2024-07") ~
+        60.12 * (Alc_pct_W - 1.15) / (78.9 * Alc_pct_W),
+      CATEGORY == "Beer" & !is.na(Alc_pct_W) & as.character(TimeM) > "2024-07" & as.character(TimeM) <= "2025-01" ~
+        61.32 * (Alc_pct_W - 1.15) / (78.9 * Alc_pct_W),
+      CATEGORY == "Beer" & !is.na(Alc_pct_W) & as.character(TimeM) > "2025-01" & as.character(TimeM) <= "2025-07" ~
+        61.57 * (Alc_pct_W - 1.15) / (78.9 * Alc_pct_W),
+
+      TRUE ~ 0
+    ),
+
+    # Construct tax
+    # GST
+    Tax_GST = if_else(!is.na(Price_std_drk_), Price_std_drk_ / 11, NA_real_),
+
+    # WET
+    Tax_WET = case_when(
+      CATEGORY == "Wine" & !is.na(Price_std_drk_) ~ Price_std_drk_ * .60 * .29,
+      CATEGORY == "Cider" & !is.na(Price_std_drk_) ~ Price_std_drk_ * .75 * .29,
+      TRUE ~ 0
+    ),
+
+    # Tax in total
+    Tax_all = Tax_std_drk + Tax_WET + Tax_GST,
+    # Price without tax
+    Price_tax_std_drk = Price_std_drk_ - Tax_all,
+    # Tax component of the retail price
+    Tax_pct = if_else(
+      !is.na(Price_std_drk_) & Price_std_drk_ > 0,
+      round(Tax_all / Price_std_drk_ * 100, 1),
+      NA_real_
+    )
+  ) %>%
+  group_by(RetPID) %>%
+  arrange(TimeM, .by_group = TRUE) %>%
+  
+  # Expected price variables
+  mutate(
+    CPI_base = first(na.omit(CPI)),
+    Net_base_real = first(na.omit(Price_tax_std_drk / CPI)),
+    Exp_net_nominal = Net_base_real * CPI,
+    EPrice_std_drk = Exp_net_nominal + Tax_all,
+    Delta_obs_exp = Price_std_drk_ - EPrice_std_drk,
+    EPrice_infl = Net_base_real * CPI,
+    EPrice_tax = Tax_all
+  ) %>%
+  ungroup()
+
+exp_df <- stk_clean
+```
+
+### Sample Composition
+
+This section describes the composition of the analytical sample used in the study. The dataset consists of product-level observations across multiple time points and beverage categories.
+
+Table 1 presents the distribution of observations and unique products across beverage categories. These figures provide an overview of each category in the sample.
+
+``` {r sample_summary}
+sample_summary <- exp_df %>%
+  summarise(
+    `Observations` = n(),
+    `Unique Products` = n_distinct(RetPID),
+    `Number of Time Points` = n_distinct(TimeM)
+  )
+
+avg_products_per_time <- exp_df %>%
+  group_by(TimeM) %>%
+  summarise(`Unique Products` = n_distinct(RetPID), .groups = "drop") %>%
+  summarise(`Average Unique Products` = mean(`Unique Products`)) %>%
+  pull(`Average Unique Products`)
+
+category_summary <- exp_df %>%
+  group_by(CATEGORY) %>%
+  summarise(
+    `Observations` = n(),
+    `Unique Products` = n_distinct(RetPID),
+   `Percentage (%)` = round(n() / nrow(exp_df) * 100, 1), # percentage of observations, rounded to 1 decimal place
+    .groups = "drop"
+  ) %>%
+  arrange(desc(`Observations`)) %>%
+  rename(
+    Category = CATEGORY
+    )
+
+# Table 1
+kable(
+  category_summary,
+  format = "html",
+  caption = "Table 1. Sample composition by beverage category.",
+  align = c("l", "r", "r", "r")
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+Wine accounted for the largest share of observations (59.1%), followed by beer (14.6%), spirits (12.0%), premixed beverages (11.0%), and cider (3.3%). 
+
+These descriptive statistics are consistent with the summary figures reported in the Word document, although the full table is not presented there.
+
+
+### Price Distribution
+
+The distribution of price per standard drink was examined across beverage categories. Summary statistics are presented in Table 2.
+
+``` {r price_distribution}
+price_summary <- exp_df %>%
+  group_by(CATEGORY) %>%
+  summarise(
+    `Median price` = median(Price_std_drk_, na.rm = TRUE), # Median price
+    `Mean price` = mean(Price_std_drk_, na.rm = TRUE), # Mean price
+    `10th percentile` = quantile(Price_std_drk_, 0.10, na.rm = TRUE), # 10th percentile price
+    `90th percentile` = quantile(Price_std_drk_, 0.90, na.rm = TRUE), # 90th percentile price
+    .groups = "drop"
+  ) %>%
+  arrange(desc(`Median price`)) %>%
+  rename(
+    Category = CATEGORY
+    ) %>%
+  mutate(across(where(is.numeric), ~ round(.x,2))) # rounded to 2 decimal places
+
+kable(
+  price_summary,
+  format = "html",
+  caption = "Table 2. Distribution of price per standard drink ($) across beverage categories, showing median, mean, and 10th and 90th percentiles.",
+  align = c("l", "r", "r", "r", "r")
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+
+```
+
+
+To examine differences across the full price distribution, empirical cumulative distribution function was used for each beverage category.
+
+
+``` {r plot_ecdf, fig.cap= "Figure 1. Cumulative distribution of price per standard drink by beverage category."}
+# Plot with empirical cumulative distribution function
+plot_ecdf_df <- exp_df %>%
+  filter(
+    is.finite(Price_std_drk_),
+    Price_std_drk_ > 0
+  )
+
+ggplot(plot_ecdf_df,
+       aes(x = Price_std_drk_, colour = CATEGORY)) +
+  stat_ecdf(linewidth = 1) +
+  coord_cartesian(xlim = c(0, 10)) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.1),
+    labels = percent_format(accuracy = 1)
+  ) +
+  labs(
+    subtitle = "(Prices above $10 per standard drink are not shown)",
+    x = "Price per Standard Drink (Australian Dollar)",
+    y = "Cumulative Percentage of Products",
+    colour = "Category"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "right"
+  )
+```
+
+The separation between categories persists across most of the distribution, suggesting that differences in price levels are not confined to specific segments but are evident from lower to higher price ranges. Prices above $10 per standard drink are not shown for visual clarity; however, these represent a small share of observations and do not materially affect the overall distributional patterns.
+
+
+### Cost Pass-Through Estimates
+
+To quantify the extent of cost pass-through, panel quantile regression models were estimated separately for each beverage category. Selected results are summarised in Table 3.
+
+
+```{r modle_setting}
+nseed <- 123
+nrep <- 200  # nrep <- 50 # test run default reps
+
+vec_cat <- c("Beer", "Cider", "Premix", "Spirits", "Wine")
+vec_qt <- c(.1, .2, .3, .4, .5, .6, .7, .8, .9)
+
+stk_DF <- exp_df %>%
+  mutate(
+    RetPID = paste(Retailer, ProductID, Location, Units_, sep = "_")
+  ) %>%
+  select(
+    contains("Cat"), TimeM, contains("Point"), contains("std_drk"),
+    RetPID, BrandStd, Title, Product, PUVar, Units_,
+    Alc_pct_1, Alc_pct_W, Size_R, Size_W, Qtr
+  ) %>%
+  group_by(RetPID, TimeM) %>%
+  slice_min(order_by = Price_std_drk_, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  group_by(RetPID) %>%
+  filter(max(Price_std_drk_, na.rm = TRUE) < 100) %>%
+  filter(n() > 1) %>%
+  ungroup()
+```
+
+``` {r main_model}
+rqtab_base <- NULL
+
+for (str_cat in vec_cat) {
+  df_cat <- stk_DF %>%
+    filter(CATEGORY == str_cat)
+
+  # MUST include | RetPID for panel structure
+  mod1 <- rqpd::rqpd(
+    formula = Price_std_drk_ ~ EPrice_std_drk | RetPID,
+    panel = rqpd::panel(
+      method = "fe",
+      taus = vec_qt,
+      tauw = rep(1 / length(vec_qt), length(vec_qt))
+    ),
+    data = df_cat
+  )
+
+   # Bootstrap summary
+  set.seed(nseed)
+  mod1_sum <- rqpd::summary.rqpd(mod1, R = nrep, covariance = TRUE)
+
+  # Key change
+  coef_tbl <- mod1_sum$coefficients %>%
+    as.data.frame() %>%
+    rownames_to_column("term") %>%
+    mutate(
+      Category = str_cat,
+      Model = "Base",
+      # get tau
+      tau = as.numeric(str_extract(term, "(?<=\\[)0\\.\\d+")),
+      var = sub("\\[.*$", "", term),
+      # 95% CI
+      ci_low = Value - 1.96 * `Std. Error`,
+      ci_high = Value + 1.96 * `Std. Error`
+    )
+
+  rqtab_base <- bind_rows(rqtab_base, coef_tbl)
+}
+```
+
+```{r create_table_pass-though_by_type}
+cost_pass_table_3qt <- rqtab_base %>%
+  filter(
+    var == "EPrice_std_drk",
+    tau %in% c(0.1, 0.5, 0.9)
+  ) %>%
+  mutate(
+    tau_label = case_when(
+      tau == 0.1 ~ "10th percentile",
+      tau == 0.5 ~ "50th percentile",
+      tau == 0.9 ~ "90th percentile"
+    ),
+    `Est. (95% CI)` = sprintf("%.2f (%.2f, %.2f)", Value, ci_low, ci_high)
+  ) %>%
+  select(Category, tau_label, `Est. (95% CI)`) %>%
+  pivot_wider(
+    names_from = tau_label,
+    values_from = `Est. (95% CI)`
+  ) %>%
+  mutate(
+    Category = factor(Category, levels = vec_cat)
+  ) %>%
+  arrange(Category)
+
+kable(
+  cost_pass_table_3qt,
+  format = "html",
+  caption = "Table 3. Cost pass-through estimates at selected quantiles by beverage category. Estimates are presented as coefficients (Est.) with 95% confidence intervals (CI). A coefficient of 1 indicates full pass-through.",
+  align =c("l", "c", "c", "c")
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  )
+```
+
+To further examine how pass-through varies across the price distribution, the estimated coefficients are plotted across quantiles in Figure 2.
+
+
+```{r plot_main_model, fig.cap= "Figure 2. Estimated cost pass-through coefficients across quantiles (τ = 0.1–0.9) by beverage category. Error bars represent 95% confidence intervals."}
+pass_df <- rqtab_base %>%
+  filter(var == "EPrice_std_drk", !is.na(tau)) %>%
+  arrange(Category, tau) %>%
+  distinct(Category, tau, .keep_all = TRUE)
+
+ggplot(pass_df,
+       aes(x = Value, y = tau, group = 1)) +  # connect by y-axis
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  geom_errorbarh(
+    aes(xmin = ci_low, xmax = ci_high),
+    height = 0.02,
+    alpha = 0.6
+  ) +
+  geom_path(linewidth = 0.5, colour = "black") +
+  geom_point(size = 1) +
+  facet_wrap(~ Category, nrow = 1, scales = "free_x") +
+  scale_y_continuous(
+    limits = c(0.1, 0.9),
+    breaks = seq(0.1, 0.9, 0.1)
+  ) +
+  labs(
+    x = "Cost Pass-Through Coefficient",
+    y = "Quantile (τ)"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+```
+
+Overall, the findings show that cost pass-through varies substantially across both beverage categories and the retail price distribution. In particular, beer, cider, and premixed beverages exhibited consistent overshifting across most quantiles, whereas spirits and wine showed pass-through patterns closer to full transmission, with evidence of undershifting at lower quantiles. In addition, lower-priced products were generally associated with weaker pass-through, indicating less complete transmission of cost increases at the lower end of the price distribution. 
+
+### Sensitivity Analysis
+
+To assess the robustness of the results, an alternative model specification including quarter as fixed effects was estimated. The resulting pass-through coefficients are presented in Figure 3.
+
+```{r sensitivity_analysis}
+# Model 2 - Sensitivity Analysis
+rqtab_sa <- NULL
+
+for (str_cat in vec_cat) {
+
+  df_cat <- stk_DF %>%
+    filter(CATEGORY == str_cat)
+
+  # MUST include | RetPID for panel structure
+  mod2 <- rqpd::rqpd(
+    formula = Price_std_drk_ ~ EPrice_std_drk + factor(Qtr) | RetPID,
+    panel = rqpd::panel(
+      method = "fe",
+      taus = vec_qt,
+      tauw = rep(1 / length(vec_qt), length(vec_qt))
+    ),
+    data = df_cat
+  )
+
+  # Bootstrap summary
+  set.seed(nseed)
+  mod2_sum <- rqpd::summary.rqpd(mod2, R = nrep, covariance = TRUE)
+
+  # Key change
+  coef_tbl <- mod2_sum$coefficients %>%
+    as.data.frame() %>%
+    rownames_to_column("term") %>%
+    mutate(
+      Category = str_cat,
+      Model = "Sensitivity Analysis",
+      # get tau
+      tau = as.numeric(str_extract(term, "(?<=\\[)0\\.\\d+")),
+      var = sub("\\[.*$", "", term),
+      # 95% CI
+      ci_low = Value - 1.96 * `Std. Error`,
+      ci_high = Value + 1.96 * `Std. Error`
+    )
+
+  rqtab_sa <- bind_rows(rqtab_sa, coef_tbl)
+}
+```
+
+```{r plot_sensivity_analysis_model, fig.cap="Figure 3. Estimated cost pass-through coefficients across quantiles by beverage category from the sensitivity analysis model."}
+pass_sa_df <- rqtab_sa %>%
+  filter(var == "EPrice_std_drk", !is.na(tau)) %>%
+  arrange(Category, tau) %>%
+  distinct(Category, tau, .keep_all = TRUE)
+
+ggplot(pass_sa_df,
+       aes(x = Value, y = tau, group = 1)) + # connect by y-axis
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  geom_errorbarh(
+    aes(xmin = ci_low, xmax = ci_high),
+    height = 0.02,
+    alpha = 0.6
+  ) +
+  geom_path(linewidth = 0.5, colour = "black") +
+  geom_point(size = 1) +
+  facet_wrap(~ Category, nrow = 1, scales = "free_x") +
+  scale_y_continuous(
+    limits = c(0.1, 0.9),
+    breaks = seq(0.1, 0.9, 0.1)
+  ) +
+  labs(
+    x = "Cost Pass-Through Coefficient",
+    y = "Quantile (τ)"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+```
+Overall, the sensitivity analysis produced results that were highly consistent with those from the baseline model. Across all beverage categories, the magnitude and direction of pass-through coefficients remained largely unchanged, and the overall patterns across the price distribution were preserved.
+
+
+
+
